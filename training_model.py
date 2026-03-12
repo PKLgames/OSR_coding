@@ -135,11 +135,16 @@ class FinalModel(ModelInterface):
 
         self.fc1 = nn.Sequential(
             nn.Linear(521, 128),
-            nn.BatchNorm1d(128), # <--- 关键：稳定分布
+            nn.BatchNorm1d(128), 
             nn.ReLU()
         )
         self.fc2 = nn.Sequential(
-            nn.Linear(128, feature_num),
+            nn.Linear(128, 64),
+            nn.BatchNorm1d(64), 
+            nn.ReLU()
+        )
+        self.fc3 = nn.Sequential(
+            nn.Linear(64, feature_num),
             nn.BatchNorm1d(feature_num), 
             nn.Tanh()
         )
@@ -164,13 +169,13 @@ class FinalModel(ModelInterface):
         #                     cluster_num = num_unknown_classes
         #                     )
         # 门控网络
-        self.num_experts = 3
-        self.num_experts_cluster = 3
+        self.num_experts = 5
+        self.num_experts_cluster = 5
         self.classifier_experts = nn.ModuleList([FlowBasedTissue(
                                                 input_dim=feature_num,
                                                 prototype_num=num_known_classes+1, # 加1表示合并未知类
                                                 condition_dim=condition_dim,
-                                                num_coupling_layers=3,
+                                                num_coupling_layers=4,
                                                 hidden_dims=[64, 64],
                                                 use_permutation=True,
                                                 permutation_type='fixed',
@@ -197,7 +202,8 @@ class FinalModel(ModelInterface):
         
         feature = self.feature_model(x, to_prob=False)
         feature = self.fc1(feature)
-        feature = self.fc2(feature) # [batch, feature_num]
+        feature = self.fc2(feature)
+        feature = self.fc3(feature) # [batch, feature_num]
         batch_size = feature.size(0)
         # print("feature:", feature.shape, feature.dtype)
 
@@ -209,7 +215,9 @@ class FinalModel(ModelInterface):
 
         # preds = self.classifier(feature, self.condition_vector)  # [batch, num_known_classes]
         
-        weights1 = self.gate1(feature, 1) # [num_experts]
+        weights1 = self.gate1(feature, 1) # [batch, num_experts]
+        weights1 = top_k_gating(weights1, k=self.num_experts) # [batch, num_experts] top-k稀疏化
+        
         preds = torch.zeros(batch_size, self.num_known_classes+1, device=self.device) # [batch, num_known_classes+1]
         for i in range(self.num_experts):
             expert_output = self.classifier_experts[i](feature, self.condition_vector)
@@ -230,7 +238,9 @@ class FinalModel(ModelInterface):
         # masked_preds, log_probs = self.clusterer(masked_feature, self.condition_vector)  # [batch, num_unknown_classes]
         # masked_preds_aug, log_probs_aug = self.clusterer(masked_feature_aug, self.condition_vector)  # [batch, num_unknown_classes]
 
-        weights2 = self.gate2(feature, 1)  # [num_experts_cluster]
+        weights2 = self.gate2(feature, 1)  # [batch, num_experts_cluster]
+        weights2 = top_k_gating(weights2, k=self.num_experts_cluster) # [batch, num_experts_cluster] top-k稀疏化
+
         masked_preds = torch.zeros(batch_size, self.num_unknown_classes, device=self.device)
         full_log_probs = torch.zeros(batch_size, self.num_unknown_classes, device=self.device)
         masked_preds_aug = torch.zeros(batch_size, self.num_unknown_classes, device=self.device)
@@ -290,7 +300,7 @@ class Trainer:
         # self.test_dataset_pair_dict = test_dataset.pair_dict
         self.device = device
         
-        self.load_balance_weight = 0.001  # 新增超参数
+        self.load_balance_weight = 0.0001  # 新增超参数
 
         # 损失函数和优化器
         # self.criterion = nn.CrossEntropyLoss()
@@ -338,16 +348,7 @@ class Trainer:
             # full_log_probs: [batch_size, num_unknown_classes] dtype=torch.float32
             # targets: [batch_size,] dtype=torch.long
 
-            uniform_weights1 = torch.ones_like(weights1) / self.model.num_experts
-            uniform_weights2 = torch.ones_like(weights2) / self.model.num_experts_cluster
-            load_balance_loss1 = F.kl_div(weights1.log(), uniform_weights1, reduction='batchmean')
-            load_balance_loss2 = F.kl_div(weights2.log(), uniform_weights2, reduction='batchmean')
-                        
-            train_loss, _ = self.calib_dataset_criterion(known_outputs, unknown_outputs, unknown_outputs_aug, targets)
-            train_loss += self.load_balance_weight * (load_balance_loss1 + load_balance_loss2)  # 加入负载平衡损失
-            # # 添加L2正则
-            # l2_reg = sum(p.pow(2).sum() for p in self.model.parameters())
-            # train_loss += 1e-4 * l2_reg
+            train_loss, _ = self.calib_dataset_criterion(known_outputs, unknown_outputs, unknown_outputs_aug, targets, weights1, weights2)
 
             # 反向传播
             self.optimizer.zero_grad()
@@ -409,34 +410,13 @@ class Trainer:
             # global_indices: [batch_size] dtype=torch.int64
             # targets: [batch_size,] dtype=torch.long
 
-            uniform_weights1 = torch.ones_like(weights1) / self.model.num_experts
-            uniform_weights2 = torch.ones_like(weights2) / self.model.num_experts_cluster
-            load_balance_loss1 = F.kl_div(weights1.log(), uniform_weights1, reduction='batchmean')
-            load_balance_loss2 = F.kl_div(weights2.log(), uniform_weights2, reduction='batchmean')
-                        
-            calib_loss, _ = self.calib_dataset_criterion(known_outputs, unknown_outputs, unknown_outputs_aug, targets)
-            calib_loss += self.load_balance_weight * (load_balance_loss1 + load_balance_loss2)  # 加入负载平衡损失
-            # # 添加L2正则
-            # l2_reg = sum(p.pow(2).sum() for p in self.model.parameters())
-            # calib_loss += 1e-4 * l2_reg
+            calib_loss, _ = self.calib_dataset_criterion(known_outputs, unknown_outputs, unknown_outputs_aug, targets, weights1, weights2)
 
             # 反向传播
             self.optimizer.zero_grad()
             calib_loss.backward()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
 
-            # ---- gradient 调试 ----
-            zero_grad_params = [
-                name for name, p in self.model.named_parameters()
-                if p.grad is None or torch.all(p.grad == 0)
-            ]
-            if zero_grad_params:
-                print(
-                    f"Warning: train step {batch_idx} has "
-                    f"{len(zero_grad_params)} zero‑grad params, "
-                    f"first few: {zero_grad_params[:5]}"
-                )
-            # ------------------------
             self.optimizer.step()
             
             # 统计
@@ -509,13 +489,8 @@ class Trainer:
                 # global_indices: [batch_size] dtype=torch.int64
                 # targets: [batch_size,] dtype=torch.long
 
-                loss, _ = self.calib_dataset_criterion(known_outputs, unknown_outputs, unknown_outputs_aug, targets)
+                loss, _ = self.calib_dataset_criterion(known_outputs, unknown_outputs, unknown_outputs_aug, targets, weights1, weights2)
                 
-                avg_weights1 = weights1.mean(dim=0)  # [num_experts]
-                avg_weights2 = weights2.mean(dim=0)  # [num_experts_cluster]
-                if any(avg_weights1 < 0.1) or any(avg_weights2 < 0.1):
-                    print(f"Warning: Expert abandonment detected. Weights1: {avg_weights1}, Weights2: {avg_weights2}")
-
                 running_loss += loss.item()
                 # 已知类正确率
                 total += targets.size(0)
@@ -824,14 +799,47 @@ def compress_targets(
 
     return new_targets
 
+def top_k_gating(weights: torch.Tensor, k: int = 3, temperature: float = 1.0) -> torch.Tensor:
+    """
+    对门控权重执行Top-K选择，只保留每行中前k个最大的值，其余置零
+    
+    Args:
+        weights: 门控权重 [batch_size, num_experts]
+        k: 选择的专家数量
+        temperature: 温度参数，控制选择的集中程度
+    
+    Returns:
+        处理后的权重 [batch_size, num_experts]，每行只有k个非零值
+    """
+    # 应用温度缩放
+    scaled_weights = weights / temperature
+    
+    # 创建掩码：找出每行中top-k的位置
+    top_k_values, top_k_indices = torch.topk(scaled_weights, k=k, dim=-1, sorted=False)
+    
+    # 创建全零张量
+    masked_weights = torch.zeros_like(weights)
+    
+    # 使用scatter_将top-k的值放回原位置
+    batch_indices = torch.arange(weights.size(0), device=weights.device).unsqueeze(-1).expand(-1, k)
+    masked_weights.scatter_(1, top_k_indices, torch.ones_like(top_k_values))
+    
+    # 将原始权重与掩码相乘，保留原始值
+    result = weights * masked_weights
+    
+    # 重新归一化，确保每行和为1
+    result = F.normalize(result, p=1, dim=-1)
+    
+    return result
+
 # ===============================
 # 7. 主程序 - 使用示例
 # ===============================
 def main():
     # 设置随机种子,以确保结果可复现
     torch.manual_seed(42)
-    origin_train_epochs = 0
-    train_epochs = 10
+    origin_train_epochs = 10
+    train_epochs = 20
 
     num_known_classes = 6
     num_sum_classes = 14
@@ -877,10 +885,10 @@ def main():
     # 更改模型结构需重加载模型：1.设置reload_feature_model_pretrained=True 2.注释掉模型加载代码 3.设置train_epochs=0 
     print("\n创建模型...")
     model = FinalModel(num_unknown_classes=num_unknown_classes, num_known_classes=num_known_classes, 
-                        reload_feature_model_pretrained=True)
+                        reload_feature_model_pretrained=False)
     print("\n加载模型...")
     # model = FinalModel.load(path='yamnet_C2MoE_origin_0.pth')
-    # model = FinalModel.load(path='experiment/yamnet_C2MoE/yamnet_C2MoE_trained_30.pth')
+    model = FinalModel.load(path='experiment/yamnet_C2MoE/yamnet_C2MoE_trained_10.pth')
 
     
     # 显示模型结构
