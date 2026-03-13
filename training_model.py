@@ -874,7 +874,7 @@ def main():
     # 2. 创建数据加载器 (优化GPU利用率)
     train_loader = DataLoader(
         train_dataset,
-        batch_size=2048,
+        batch_size=1024,
         shuffle=True,
         num_workers=8,           # 增加数据加载并行数
         pin_memory=True,         # 加速CPU→GPU传输
@@ -884,7 +884,7 @@ def main():
     
     calib_loader = DataLoader(
         calib_dataset,
-        batch_size=2048,
+        batch_size=1024,
         shuffle=True,
         num_workers=8,
         pin_memory=True,
@@ -894,7 +894,7 @@ def main():
 
     test_loader = DataLoader(
         test_dataset,
-        batch_size=2048,
+        batch_size=1024,
         shuffle=False,
         num_workers=8,
         pin_memory=True,
