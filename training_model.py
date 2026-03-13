@@ -16,6 +16,11 @@ import random
 # 启用cudnn benchmark加速
 torch.backends.cudnn.benchmark = True
 
+# 启用TF32加速 (Ampere架构GPU)
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
+
 from utils.TAU22 import TAUDataset
 import yamnet_PT_inference as yamnet_infer
 from torch_audioset.yamnet.model import yamnet as torch_yamnet
@@ -292,6 +297,9 @@ class Trainer:
         self.device = device
         
         self.load_balance_weight = 0.0001  # 新增超参数
+        
+        # 梯度累积参数 - 减少GPU空闲时间
+        self.accumulation_steps = 1  # 每个batch都更新参数，提高GPU利用率
 
         # 损失函数和优化器
         # self.criterion = nn.CrossEntropyLoss()
@@ -308,7 +316,8 @@ class Trainer:
             use_curriculum=True  # 启用课程学习
         )
         # 改进优化器：降低学习率，增加weight_decay防过拟合
-        self.optimizer = optim.Adam(self.model.parameters(), lr=0.0005, weight_decay=1e-4)
+        # 使用融合优化器提高效率
+        self.optimizer = optim.AdamW(self.model.parameters(), lr=0.0005, weight_decay=1e-4)
         
         # 学习率调度器 - 使用更平滑的衰减
         self.scheduler = optim.lr_scheduler.StepLR(self.optimizer, step_size=3, gamma=0.7)
@@ -332,13 +341,15 @@ class Trainer:
             'test_acc': [],
             'test_cluster_acc': []
         }
+
     
     def train_calib_epoch(self) -> Tuple[float, float]:
-        """训练一个epoch"""
+        """训练一个epoch - 带梯度累积以提高GPU利用率"""
         self.model.train()
         train_running_loss = 0.0
         train_correct = 0
         train_total = 0
+        self.optimizer.zero_grad()  # 初始化梯度
         
         for batch_idx, item in enumerate(self.train_loader):
             inputs, targets = item['source_audio'].to(self.device), item['target'].squeeze(1).to(self.device)
@@ -354,36 +365,26 @@ class Trainer:
             # targets: [batch_size,] dtype=torch.long
 
             train_loss, _ = self.calib_dataset_criterion(known_outputs, unknown_outputs, unknown_outputs_aug, targets, weights1, weights2)
-
-            # 反向传播
-            self.optimizer.zero_grad()
+            
+            # 缩放损失用于梯度累积
+            train_loss = train_loss / self.accumulation_steps
             train_loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-
-            # # ---- gradient 调试 ----
-            # zero_grad_params = [
-            #     name for name, p in self.model.named_parameters()
-            #     if p.grad is None or torch.all(p.grad == 0)
-            # ]
-            # if zero_grad_params:
-            #     print(
-            #         f"Warning: train step {batch_idx} has "
-            #         f"{len(zero_grad_params)} zero‑grad params, "
-            #         f"first few: {zero_grad_params[:5]}"
-            #     )
-            # # ------------------------
             
-            self.optimizer.step()
+            # 梯度累积：达到累积步数后更新参数
+            if (batch_idx + 1) % self.accumulation_steps == 0 or (batch_idx + 1) == len(self.train_loader):
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                self.optimizer.step()
+                self.optimizer.zero_grad()
             
-            # 统计
-            train_running_loss += train_loss.item()
+            # 统计（恢复实际损失值）
+            train_running_loss += train_loss.item() * self.accumulation_steps
             _, predicted = known_outputs.max(1)
             train_total += targets.size(0)
             train_correct += predicted.eq(targets).sum().item()
             
             # 每100个batch打印一次
             if batch_idx % 100 == 99:
-                print(f'  Batch: {batch_idx+1}, Train_Loss: {train_loss.item():.4f}')
+                print(f'  Batch: {batch_idx+1}, Train_Loss: {train_loss.item() * self.accumulation_steps:.4f}')
         
         train_epoch_loss = train_running_loss / len(self.train_loader)
         train_epoch_acc = 100. * train_correct / train_total
@@ -393,12 +394,8 @@ class Trainer:
         calib_total = 0
         calib_cluster_correct = 0
         calib_cluster_total = 1  # 避免除零错误
-
-        # # 初始化，调试用
-        # L_r_val_running_loss = 0.0
-        # L_known_val_running_loss = 0.0
-        # L_unknown_val_running_loss = 0.0
-        # L_pairwise_val_running_loss = 0.0
+        
+        self.optimizer.zero_grad()  # 初始化校准集的梯度
         
         for batch_idx, item in enumerate(self.calib_loader):
             inputs, targets = item['source_audio'].to(self.device), item['target'].squeeze(1).to(self.device)
@@ -416,16 +413,19 @@ class Trainer:
             # targets: [batch_size,] dtype=torch.long
 
             calib_loss, _ = self.calib_dataset_criterion(known_outputs, unknown_outputs, unknown_outputs_aug, targets, weights1, weights2)
-
-            # 反向传播
-            self.optimizer.zero_grad()
-            calib_loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-
-            self.optimizer.step()
             
-            # 统计
-            calib_running_loss += calib_loss.item()
+            # 梯度累积
+            calib_loss = calib_loss / self.accumulation_steps
+            calib_loss.backward()
+            
+            # 梯度累积：达到累积步数后更新参数
+            if (batch_idx + 1) % self.accumulation_steps == 0 or (batch_idx + 1) == len(self.calib_loader):
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                self.optimizer.step()
+                self.optimizer.zero_grad()
+            
+            # 统计（恢复实际损失值）
+            calib_running_loss += calib_loss.item() * self.accumulation_steps
             # 已知类正确率
             calib_total += targets.size(0)
             _, predicted = known_outputs.max(1)
@@ -436,20 +436,14 @@ class Trainer:
             _, predicted_unknown_aug = unknown_outputs_aug.max(1)
             calib_cluster_correct += predicted_unknown.eq(predicted_unknown_aug).sum().item()
 
-
-            # # 统计各个损失项的值，调试用
-            # L_r_val_running_loss += L_r_val.item()
-            # L_known_val_running_loss += L_known_val.item()
-            # L_unknown_val_running_loss += L_unknown_val.item()
-            # L_pairwise_val_running_loss += L_pairwise_val.item()
-            
             # 每100个batch打印一次
             if batch_idx % 100 == 99:
-                print(f'  Batch: {batch_idx+1}, Calib_Loss: {calib_loss.item():.4f}')
+                print(f'  Batch: {batch_idx+1}, Calib_Loss: {calib_loss.item() * self.accumulation_steps:.4f}')
         
         calib_epoch_loss = calib_running_loss / len(self.calib_loader)
         calib_epoch_acc = 100. * calib_correct / calib_total
         calib_epoch_cluster_acc = 100. * calib_cluster_correct / calib_cluster_total
+
 
         # # 打印各个损失项的平均值，调试用
         # L_r_val_epoch_loss = L_r_val_running_loss / len(self.calib_loader)
@@ -481,18 +475,13 @@ class Trainer:
         
         with torch.no_grad():
             for batch_idx, item in enumerate(self.test_loader):
-                inputs, targets = item['source_audio'].to(self.device), item['target'].squeeze(1).to(self.device)
+                # 使用non_blocking加速数据传输
+                inputs = item['source_audio'].to(self.device, non_blocking=True)
+                targets = item['target'].squeeze(1).to(self.device, non_blocking=True)
                 targets = compress_targets(targets, self.num_known_classes) # 压缩标签为 [batch, known_classes + 1] 形式
-                # global_indices = item['idx'].to(self.device)  # 获取全局索引
                 targets = targets.argmax(dim=1).long()  # 转换为类别索引
 
                 known_outputs, unknown_outputs, unknown_outputs_aug, weights1, weights2 = self.model(inputs)
-                # known_outputs: [batch_size, num_known_classes+1] dtype=torch.float32 
-                # unknown_outputs: [batch_size, num_unknown_classes] dtype=torch.float32
-                # unknown_outputs_aug: [batch_size, num_unknown_classes] dtype=torch.float32
-                # full_log_probs: [batch_size, num_unknown_classes] dtype=torch.float32
-                # global_indices: [batch_size] dtype=torch.int64
-                # targets: [batch_size,] dtype=torch.long
 
                 loss, _ = self.calib_dataset_criterion(known_outputs, unknown_outputs, unknown_outputs_aug, targets, weights1, weights2)
                 
@@ -506,12 +495,6 @@ class Trainer:
                 _, predicted_unknown = unknown_outputs.max(1)
                 _, predicted_unknown_aug = unknown_outputs_aug.max(1)
                 cluster_correct += predicted_unknown.eq(predicted_unknown_aug).sum().item()
-
-                # # 统计各个损失项的值，调试用
-                # L_r_val_running_loss += L_r_val.item()
-                # L_known_val_running_loss += L_known_val.item()
-                # L_unknown_val_running_loss += L_unknown_val.item()
-                # L_pairwise_val_running_loss += L_pairwise_val.item()
         
         test_loss = running_loss / len(self.test_loader)
         test_acc = 100. * correct / total
@@ -864,6 +847,17 @@ def main():
     num_sum_classes = 14
     num_unknown_classes = num_sum_classes - num_known_classes
 
+    # 检测GPU并设置最优配置
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        # 获取GPU基本信息
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+        print(f"显存总量: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
+        
+        # 优化CUDA配置
+        torch.cuda.set_device(0)
+        # 设置内存分配器arena大小（有助于减少碎片）
+        torch.cuda.set_per_process_memory_fraction(0.95)  # 留5%给系统
     
     # 1. 创建数据集
     print("加载数据集...")
@@ -871,36 +865,43 @@ def main():
     calib_dataset = TAUDataset(split='calib')# 校准集包含已知类和未知类
     test_dataset = TAUDataset(split='test')# 验证集包含已知类和未知类
     
-    # 2. 创建数据加载器 (优化GPU利用率)
+    # 2. 创建数据加载器 - 优化数据管道减少GPU等待
+    batch_size = 2048
+    
     train_loader = DataLoader(
         train_dataset,
-        batch_size=1024,
+        batch_size=batch_size,
         shuffle=True,
-        num_workers=8,           # 增加数据加载并行数
+        num_workers=16,           # 适中的workers数量
         pin_memory=True,         # 加速CPU→GPU传输
-        prefetch_factor=4,      # 预加载批次
-        persistent_workers=True  # 保持worker进程
+        prefetch_factor=2,      # 减少预加载降低内存压力
+        persistent_workers=True,  
+        drop_last=True           
     )
     
     calib_loader = DataLoader(
         calib_dataset,
-        batch_size=1024,
+        batch_size=batch_size,
         shuffle=True,
-        num_workers=8,
+        num_workers=16,
         pin_memory=True,
-        prefetch_factor=4,
-        persistent_workers=True
+        prefetch_factor=2,
+        persistent_workers=True,
+        drop_last=True
     )
 
     test_loader = DataLoader(
         test_dataset,
-        batch_size=1024,
+        batch_size=batch_size,
         shuffle=False,
-        num_workers=8,
+        num_workers=16,
         pin_memory=True,
-        prefetch_factor=4,
+        prefetch_factor=2,
         persistent_workers=True
     )
+    
+    print(f"Batch size: {batch_size}")
+
     
     # 显示数据集信息
     # print(f"已知类别: {train_dataset.get_class_names()}")
