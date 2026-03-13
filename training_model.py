@@ -317,13 +317,13 @@ class Trainer:
         )
         # 改进优化器：降低学习率，增加weight_decay防过拟合
         # 使用融合优化器提高效率
-        self.optimizer = optim.AdamW(self.model.parameters(), lr=0.0005, weight_decay=1e-4)
+        self.optimizer = optim.AdamW(self.model.parameters(), lr=0.0001, weight_decay=1e-3)
         
         # 学习率调度器 - 使用更平滑的衰减
         self.scheduler = optim.lr_scheduler.StepLR(self.optimizer, step_size=3, gamma=0.7)
         
         # 早停机制参数
-        self.patience = 3  # 早停耐心值
+        self.patience = 5  # 早停耐心值
         self.best_val_loss = float('inf')
         self.early_stop_counter = 0
         # self.scheduler = optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=30, eta_min=1e-5)  # 替换StepLR
@@ -840,7 +840,7 @@ def top_k_gating(weights: torch.Tensor, k: int = 3, temperature: float = 1.0) ->
 def main():
     # 设置随机种子,以确保结果可复现
     torch.manual_seed(42)
-    origin_train_epochs = 0
+    origin_train_epochs = 60
     train_epochs = 20
 
     num_known_classes = 6
@@ -874,7 +874,7 @@ def main():
         shuffle=True,
         num_workers=16,           # 适中的workers数量
         pin_memory=True,         # 加速CPU→GPU传输
-        prefetch_factor=2,      # 减少预加载降低内存压力
+        prefetch_factor=8,      # 减少预加载降低内存压力
         persistent_workers=True,  
         drop_last=True           
     )
@@ -885,7 +885,7 @@ def main():
         shuffle=True,
         num_workers=16,
         pin_memory=True,
-        prefetch_factor=2,
+        prefetch_factor=8,
         persistent_workers=True,
         drop_last=True
     )
@@ -896,7 +896,7 @@ def main():
         shuffle=False,
         num_workers=16,
         pin_memory=True,
-        prefetch_factor=2,
+        prefetch_factor=8,
         persistent_workers=True
     )
     
@@ -914,12 +914,11 @@ def main():
     # 更改模型结构需重加载模型：1.设置reload_feature_model_pretrained=True 2.注释掉模型加载代码 3.设置train_epochs=0 
     print("\n创建模型...")
     model = FinalModel(num_unknown_classes=num_unknown_classes, num_known_classes=num_known_classes, 
-                        reload_feature_model_pretrained=True)
+                        reload_feature_model_pretrained=False)
     print("\n加载模型...")
     # 由于PolicyNet结构变化导致参数不兼容，从头训练
     # model = FinalModel.load(path='yamnet_C2MoE_origin_0.pth')
-    # model = FinalModel.load(path='experiment/yamnet_C2MoE/yamnet_C2MoE_trained_10.pth')
-    print("从头训练新模型（PolicyNet结构已更新含Dropout）")
+    model = FinalModel.load(path='experiment/yamnet_C2MoE/yamnet_C2MoE_trained_60.pth')
 
     
     # 显示模型结构
