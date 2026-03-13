@@ -13,6 +13,9 @@ import numpy as np
 import os
 import random
 
+# 启用cudnn benchmark加速
+torch.backends.cudnn.benchmark = True
+
 from utils.TAU22 import TAUDataset
 import yamnet_PT_inference as yamnet_infer
 from torch_audioset.yamnet.model import yamnet as torch_yamnet
@@ -74,29 +77,18 @@ class PolicyNet(nn.Module):
     def __init__(self, in_dim, out_dim):
         super(PolicyNet, self).__init__()
         self.in_dim = in_dim
-        self.net = nn.Sequential(
-            nn.Linear(in_dim, 256),
-            nn.LeakyReLU(0.1, inplace=True),
-            nn.BatchNorm1d(256),
-            nn.Linear(256, 32),
-            nn.LeakyReLU(0.1, inplace=True),
-            nn.BatchNorm1d(32),
-            nn.Linear(32, out_dim))
-
-        # self.net = nn.Sequential(
-        #     nn.Linear(in_dim, 512),  # 增加隐藏单元
-        #     nn.LeakyReLU(0.1, inplace=True),
-        #     nn.BatchNorm1d(512),
-        #     nn.Dropout(0.1),  # 新增dropout
-        #     nn.Linear(512, 128),
-        #     nn.LeakyReLU(0.1, inplace=True),
-        #     nn.BatchNorm1d(128),
-        #     nn.Dropout(0.1),
-        #     nn.Linear(128, out_dim)
-        # )
+        self.fc1 = nn.Linear(in_dim, 256)
+        self.bn1 = nn.BatchNorm1d(256)
+        self.drop1 = nn.Dropout(0.2)  # 添加Dropout防过拟合
+        self.fc2 = nn.Linear(256, 32)
+        self.bn2 = nn.BatchNorm1d(32)
+        self.drop2 = nn.Dropout(0.1)  # 添加Dropout防过拟合
+        self.fc3 = nn.Linear(32, out_dim)
 
     def forward(self, x, temp):
-        logits = self.net(x)
+        x = self.drop1(F.leaky_relu(self.bn1(self.fc1(x)), 0.1))
+        x = self.drop2(F.leaky_relu(self.bn2(self.fc2(x)), 0.1))
+        logits = self.fc3(x)
         hard_mask = F.gumbel_softmax(logits, tau=temp, hard=True, dim=-1)
         return hard_mask
 
@@ -196,9 +188,8 @@ class FinalModel(ModelInterface):
         # 可训练阈值（标量参数）
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x.to(self.cpudevice).numpy()
-        x = yamnet_infer.waveform_to_log_mel_patches(x, sample_rate=16000)
-        x = torch.from_numpy(x).to(self.device)  # [batch, N, 96, 64]
+        # Use GPU-based feature extraction for better performance
+        x = yamnet_infer.waveform_to_log_mel_patches_gpu(x, sample_rate=16000)  # [batch, N, 96, 64] on GPU
         
         feature = self.feature_model(x, to_prob=False)
         feature = self.fc1(feature)
@@ -307,11 +298,25 @@ class Trainer:
         self.num_known_classes = self.model.num_known_classes  # 已知类数
         num_unknown_classes = self.model.num_unknown_classes  # 未知类数
         self.train_dataset_criterion = TrainDatasetLoss()
-        self.calib_dataset_criterion = CalibDatasetLoss(lambda_ps=0.5, lambda_reg=0.1, lambda_ent=0.05)
-        self.optimizer = optim.Adam(self.model.parameters(), lr=0.001, weight_decay=5e-5)
+        # 改进损失函数参数：增加熵正则权重，启用课程学习
+        self.calib_dataset_criterion = CalibDatasetLoss(
+            lambda_ps=0.5, 
+            lambda_reg=0.2,   # 增加簇平衡正则
+            lambda_ent=0.15,   # 增加熵正则防过拟合
+            lambda_exprt1=0.1, 
+            lambda_exprt2=0.05,
+            use_curriculum=True  # 启用课程学习
+        )
+        # 改进优化器：降低学习率，增加weight_decay防过拟合
+        self.optimizer = optim.Adam(self.model.parameters(), lr=0.0005, weight_decay=1e-4)
         
-        # 学习率调度器
-        self.scheduler = optim.lr_scheduler.StepLR(self.optimizer, step_size=5, gamma=0.5)
+        # 学习率调度器 - 使用更平滑的衰减
+        self.scheduler = optim.lr_scheduler.StepLR(self.optimizer, step_size=3, gamma=0.7)
+        
+        # 早停机制参数
+        self.patience = 3  # 早停耐心值
+        self.best_val_loss = float('inf')
+        self.early_stop_counter = 0
         # self.scheduler = optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=30, eta_min=1e-5)  # 替换StepLR
         
         
@@ -557,18 +562,32 @@ class Trainer:
             print(f'训练 Loss: {train_loss:.4f}, Acc: {train_acc:.2f}%')
             print(f'校准 Loss: {calib_loss:.4f}, Acc: {calib_acc:.2f}%, Cluster Acc: {calib_cluster_acc:.2f}%')
             print(f'验证 Loss: {test_loss:.4f}, Acc: {test_acc:.2f}%, Cluster Acc: {test_cluster_acc:.2f}%')
+            
+            # 早停检查
+            if test_loss < self.best_val_loss:
+                self.best_val_loss = test_loss
+                self.early_stop_counter = 0
+                # 保存最佳模型
+                self.model.save('experiment/yamnet_C2MoE/yamnet_C2MoE_best.pth')
+                print(f'  >> 保存最佳模型 (Val Loss: {test_loss:.4f})')
+            else:
+                self.early_stop_counter += 1
+                print(f'  >> 早停计数: {self.early_stop_counter}/{self.patience}')
+                if self.early_stop_counter >= self.patience:
+                    print(f'\n!!! 早停触发，停止训练 !!!')
+                    break
     
             # 添加 TensorBoard 观测门控权重分布
-            writer.add_histogram('Gate1/Weights', self.model.gate1.net[0].weight, epoch)  # 观测 gate1 第一层权重
-            writer.add_histogram('Gate1/Biases', self.model.gate1.net[0].bias, epoch)    # 观测 gate1 第一层偏置
-            writer.add_histogram('Gate2/Weights', self.model.gate2.net[0].weight, epoch)  # 观测 gate2 第一层权重
-            writer.add_histogram('Gate2/Biases', self.model.gate2.net[0].bias, epoch)    # 观测 gate2 第一层偏置
+            writer.add_histogram('Gate1/Weights', self.model.gate1.fc1.weight, epoch)  # 观测 gate1 第一层权重
+            writer.add_histogram('Gate1/Biases', self.model.gate1.fc1.bias, epoch)    # 观测 gate1 第一层偏置
+            writer.add_histogram('Gate2/Weights', self.model.gate2.fc1.weight, epoch)  # 观测 gate2 第一层权重
+            writer.add_histogram('Gate2/Biases', self.model.gate2.fc1.bias, epoch)    # 观测 gate2 第一层偏置
 
             # 可选：观测梯度（如果需要）
-            if self.model.gate1.net[0].weight.grad is not None:
-                writer.add_histogram('Gate1/Grad_Weights', self.model.gate1.net[0].weight.grad, epoch)
-            if self.model.gate2.net[0].weight.grad is not None:
-                writer.add_histogram('Gate2/Grad_Weights', self.model.gate2.net[0].weight.grad, epoch)
+            if self.model.gate1.fc1.weight.grad is not None:
+                writer.add_histogram('Gate1/Grad_Weights', self.model.gate1.fc1.weight.grad, epoch)
+            if self.model.gate2.fc1.weight.grad is not None:
+                writer.add_histogram('Gate2/Grad_Weights', self.model.gate2.fc1.weight.grad, epoch)
 
     def plot_history(self,from_epochs: int, to_epochs: int):
         """绘制训练历史"""
@@ -838,7 +857,7 @@ def top_k_gating(weights: torch.Tensor, k: int = 3, temperature: float = 1.0) ->
 def main():
     # 设置随机种子,以确保结果可复现
     torch.manual_seed(42)
-    origin_train_epochs = 10
+    origin_train_epochs = 0
     train_epochs = 20
 
     num_known_classes = 6
@@ -852,26 +871,35 @@ def main():
     calib_dataset = TAUDataset(split='calib')# 校准集包含已知类和未知类
     test_dataset = TAUDataset(split='test')# 验证集包含已知类和未知类
     
-    # 2. 创建数据加载器
+    # 2. 创建数据加载器 (优化GPU利用率)
     train_loader = DataLoader(
         train_dataset,
-        batch_size=1024,
+        batch_size=2048,
         shuffle=True,
-        num_workers=2
+        num_workers=8,           # 增加数据加载并行数
+        pin_memory=True,         # 加速CPU→GPU传输
+        prefetch_factor=4,      # 预加载批次
+        persistent_workers=True  # 保持worker进程
     )
     
     calib_loader = DataLoader(
         calib_dataset,
-        batch_size=1024,
+        batch_size=2048,
         shuffle=True,
-        num_workers=2
+        num_workers=8,
+        pin_memory=True,
+        prefetch_factor=4,
+        persistent_workers=True
     )
 
     test_loader = DataLoader(
         test_dataset,
-        batch_size=1024,
+        batch_size=2048,
         shuffle=False,
-        num_workers=2
+        num_workers=8,
+        pin_memory=True,
+        prefetch_factor=4,
+        persistent_workers=True
     )
     
     # 显示数据集信息
@@ -885,10 +913,12 @@ def main():
     # 更改模型结构需重加载模型：1.设置reload_feature_model_pretrained=True 2.注释掉模型加载代码 3.设置train_epochs=0 
     print("\n创建模型...")
     model = FinalModel(num_unknown_classes=num_unknown_classes, num_known_classes=num_known_classes, 
-                        reload_feature_model_pretrained=False)
+                        reload_feature_model_pretrained=True)
     print("\n加载模型...")
+    # 由于PolicyNet结构变化导致参数不兼容，从头训练
     # model = FinalModel.load(path='yamnet_C2MoE_origin_0.pth')
-    model = FinalModel.load(path='experiment/yamnet_C2MoE/yamnet_C2MoE_trained_10.pth')
+    # model = FinalModel.load(path='experiment/yamnet_C2MoE/yamnet_C2MoE_trained_10.pth')
+    print("从头训练新模型（PolicyNet结构已更新含Dropout）")
 
     
     # 显示模型结构

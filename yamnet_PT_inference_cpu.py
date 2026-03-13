@@ -23,8 +23,6 @@ import time
 
 import numpy as np
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 import librosa
 
 from torch_audioset.yamnet.model import yamnet as torch_yamnet
@@ -103,102 +101,6 @@ def waveform_to_log_mel_patches(waveform: np.ndarray,
     result = np.stack(all_patches, axis=0)
     if return_single:
         result = result[0]
-    return result
-
-
-def waveform_to_log_mel_patches_gpu(waveform: torch.Tensor,
-                                   sample_rate: int = 16000,
-                                   n_mels: int = 64,
-                                   window_seconds: float = 0.025,
-                                   hop_seconds: float = 0.01,
-                                   patch_frames: int = 96,
-                                   fmin: float = 0.0,
-                                   fmax: float = 8000.0) -> torch.Tensor:
-    """
-    GPU-based version of waveform_to_log_mel_patches using PyTorch.
-    Input: (batch_size, length) tensor on GPU
-    Output: (batch_size, N, patch_frames, n_mels) tensor on GPU
-    """
-    if waveform.ndim == 1:
-        waveform = waveform.unsqueeze(0)
-    
-    batch_size = waveform.shape[0]
-    device = waveform.device
-    
-    # Parameters
-    n_fft = int(round(window_seconds * sample_rate))
-    hop_length = int(round(hop_seconds * sample_rate))
-    win_length = n_fft
-    
-    # Create mel filterbank
-    mel_basis = librosa.filters.mel(sr=sample_rate, n_fft=n_fft, n_mels=n_mels, fmin=fmin, fmax=fmax)
-    mel_basis = torch.from_numpy(mel_basis).float().to(device)
-    
-    # Hann window
-    window = torch.hann_window(win_length).to(device)
-    
-    all_patches = []
-    
-    for b in range(batch_size):
-        wf = waveform[b].float()  # (length,)
-        
-        # Compute mel spectrogram using torch.stft
-        spec = torch.stft(
-            wf,
-            n_fft=n_fft,
-            hop_length=hop_length,
-            win_length=win_length,
-            window=window,
-            center=True,
-            return_complex=True
-        )
-        
-        # Compute power spectrogram
-        spec = torch.abs(spec) ** 2
-        
-        # Apply mel filterbank
-        mel = torch.matmul(mel_basis, spec)  # (n_mels, frames)
-        
-        # Convert to log scale (add small epsilon to avoid log(0))
-        log_mel = torch.log(mel + 1e-8)
-        
-        # Transpose to (frames, n_mels)
-        log_mel = log_mel.T
-        
-        # Build patches
-        n_frames = log_mel.shape[0]
-        if n_frames < patch_frames:
-            # Pad with minimum value
-            pad_amount = patch_frames - n_frames
-            min_val = log_mel.min()
-            pad = torch.full((pad_amount, n_mels), min_val, device=device)
-            log_mel = torch.cat([log_mel, pad], dim=0)
-            n_frames = log_mel.shape[0]
-        
-        # Number of non-overlapping patches
-        n_patches = n_frames // patch_frames
-        patches = []
-        for i in range(n_patches):
-            s = i * patch_frames
-            patch = log_mel[s:s + patch_frames]  # (patch_frames, n_mels)
-            patches.append(patch)
-        
-        if patches:
-            patches = torch.stack(patches, dim=0)  # (n_patches, patch_frames, n_mels)
-        else:
-            patches = torch.zeros((1, patch_frames, n_mels), dtype=torch.float32, device=device)
-        
-        all_patches.append(patches)
-    
-    # Pad to same number of patches across batch if needed
-    max_patches = max(p.shape[0] for p in all_patches)
-    for i in range(batch_size):
-        if all_patches[i].shape[0] < max_patches:
-            pad_size = max_patches - all_patches[i].shape[0]
-            pad = torch.zeros((pad_size, patch_frames, n_mels), dtype=torch.float32, device=device)
-            all_patches[i] = torch.cat([all_patches[i], pad], dim=0)
-    
-    result = torch.stack(all_patches, dim=0)  # (batch_size, max_patches, patch_frames, n_mels)
     return result
 
 
